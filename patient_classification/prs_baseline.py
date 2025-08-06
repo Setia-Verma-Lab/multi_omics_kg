@@ -84,7 +84,8 @@ def bootstrap_metrics(y_true, y_prob, y_pred, n_boot=1000, seed=42):
 def evaluate_with_bootstrap(name, X, y, clf, n_boot=1000):
     # get probabilities and hard preds
     y_prob = clf.predict_proba(X)[:, 1]
-    y_pred = clf.predict(X)
+    # y_pred = clf.predict(X) (uses standard 0.5 threshold)
+    y_pred = (clf.predict_proba(X)[:,1] >= 0.5).astype(bool)
     y_true = y.values if hasattr(y, 'values') else np.asarray(y)
 
     # point‐estimates
