@@ -1,0 +1,235 @@
+# Self-contained: extraction + merging scores
+import pandas as pd
+import numpy as np
+import gzip
+
+existing_endo_file = 'existing_endo'
+new_endo_file = 'new_endo'
+DATA = [existing_endo_file, new_endo_file]
+DISEASE = "endo"
+# CHR_LIST = [str(chr) for chr in range(1, 23)]  # chromosomes 1-22
+CHR_LIST = ["2", "5", "7", "9", "14", "15"]
+
+rule all:
+    input:
+        # expand("Annotations/{data}_merged_ld_annotations.txt", data=new_endo_file)
+        # expand('Annotations/{new_endo_file}_merged_ld_linkpred_scores.txt', new_endo_file=new_endo_file)
+        # expand('Annotations/{new_endo_file}_merged_ld_linkpred_scores.txt', new_endo_file=new_endo_file)
+        # expand('Annotations/{existing_endo_file}_merged_ld_linkpred_scores.txt', existing_endo_file=existing_endo_file)
+        # 'Annotations/endo_merged_gbmi_ld_linkpred.txt'
+        'Annotations/obesity_merged_linkpred.txt'
+        
+
+# prepping for LDmatrix input (need to make chr separated txt files of rsid)
+rule make_chr_sep:
+    input:
+        file = "Annotations/{data}_biofilter_snps_annotations.txt"
+    output:
+        labels="Annotations/{data}_chr{chr}_position_labels.txt"
+    run:
+        df = pd.read_csv(input.file, sep='\t')
+        df['chr'] = df['chr'].astype(str)  # ensure chr is string
+        for chrom, grp in df.groupby('chr'):
+            sub = df[df["chr"] == wildcards.chr] # get data for this chromosome
+            # write only the position_label column
+            sub["position_label"].to_csv(output.labels, index=False, header=False)
+    
+# I took all the output files, and for each new link preds chr file, 
+# I took the snps in that file and did LDmatrix with that list 
+# against the existing link preds chr file (making sure that the chromosome is the same)
+# I have downloaded those LDMatrix output files per chromosome. 
+
+rule merge_ld_scores:
+    # takes in chr specific LD matrix output files, determines the row wise max LD score for each SNP (ignoring diagonal),
+    # and merges that with the corresponding annotation file for the new link preds for specific disease
+    # resulting file has rsid, chr, pos, ld_score as columns
+    input:
+        ld_files = expand("Annotations/ld_{data}_chr{chr}.txt", data=DISEASE, chr=CHR_LIST),
+        ann_file = "Annotations/{new_endo_file}_biofilter_snps_annotations.txt"
+    output:
+        merged = "Annotations/{new_endo_file}_merged_ld_annotations.txt"
+    run:
+        dfs = []
+        for file in input.ld_files:
+            df = pd.read_csv(file, sep="\t", index_col=0)
+
+            # mask the diagonal with NaN, then take row‐wise max
+            mask = np.eye(df.shape[0], dtype=bool)
+            df_masked = df.mask(mask)              
+            max_excl_diag = df_masked.max(axis=1) 
+            df["ld_score"] = max_excl_diag
+            df.reset_index(inplace=True)  # reset index to make it a column
+            df = df[['RS_number', 'ld_score']]
+
+            dfs.append(df)
+
+        concat_df = pd.concat(dfs, ignore_index=True) # stacks dataframes vertically
+        
+        # Load the annotation file
+        df_ann = pd.read_csv(input.ann_file, sep="\t")
+        
+        # Merge the LD scores with the annotation file
+        merged_df = pd.merge(df_ann, concat_df, left_on='position_label', right_on='RS_number', how='left')
+        
+        # replace NaN values in 'ld_score' with 0
+        merged_df['ld_score'].fillna(0, inplace=True)
+        merged_df.rename(columns={'position_label': 'rsid'}, inplace=True)
+
+        # Save the merged DataFrame
+        merged_df.to_csv(output.merged, sep="\t", index=False, columns=['rsid', 'chr', 'pos', 'ld_score'])
+
+# now i need to merge this file with the new link preds original file, which has the model scores for the link prediction
+# had to comment out the rule below when running the existing rule parallel below, and vice versa
+# FOR NEW LINK PREDICTIONS 
+# rule merge_new_ld_scores_with_linkpred_scores:
+#     input:
+#         ld_file = "Annotations/{new_endo_file}_merged_ld_annotations.txt",
+#         linkpred_file = "../new_snp_endo_scores.csv"
+#     output:
+#         merged = 'Annotations/{new_endo_file}_merged_ld_linkpred_scores.txt'
+#     run:
+#         # Load the LD scores file
+#         ld_df = pd.read_csv(input.ld_file, sep="\t")
+        
+#         # Load the link prediction scores file
+#         linkpred_df = pd.read_csv(input.linkpred_file)
+#         # add rs prefix to rsid
+#         linkpred_df['rsid'] = linkpred_df['rsid'].apply(lambda x: f"rs{x}")
+#         linkpred_df.rename(columns={'score': 'linkpred_score'}, inplace=True)  # ensure columns are named correctly
+#         ld_df = ld_df.drop_duplicates(subset='rsid', keep='first')
+        
+#         # Merge the two DataFrames on 'rsid'
+#         merged_df = pd.merge(linkpred_df, ld_df, on='rsid', how='left')
+
+#         # >>> merged_df['chr'].isna().sum()
+#         # np.int64(5373) -> going to drop these for now
+#         merged_df = merged_df[merged_df['chr'].notna()]
+        
+#         # Save the merged DataFrame
+#         merged_df.to_csv(output.merged, sep="\t", index=False)
+
+# FOR EXISTING LINK PREDICTIONS
+# rule merge_existing_annots_with_linkpred_scores:
+#     input:
+#         ann_file = 'Annotations/{existing_endo_file}_biofilter_snps_annotations.txt',
+#         linkpred_file = '../existing_snp_endo_scores.csv'
+#     output:
+#         merged = 'Annotations/{existing_endo_file}_merged_ld_linkpred_scores.txt'
+#     run:
+#         ann_df = pd.read_csv(input.ann_file, sep="\t", usecols=['position_label', 'chr', 'pos'])
+#         ann_df.rename(columns={'position_label': 'rsid'}, inplace=True)  # rename to match linkpred file
+
+#         linkpred_df = pd.read_csv(input.linkpred_file)
+#         # add rs prefix to rsid
+#         linkpred_df['rsid'] = linkpred_df['rsid'].apply(lambda x: f"rs{x}")
+#         linkpred_df.rename(columns={'score': 'linkpred_score'}, inplace=True)  # ensure columns are named correctly
+
+#         # Merge the two DataFrames on 'rsid'
+#         merged_df = pd.merge(linkpred_df, ann_df, on='rsid', how='left')
+#         # Save the merged DataFrame
+#         merged_df.to_csv(output.merged, sep="\t", index=False)
+
+
+# then search through GBMI sumstats for these rsids, and get the OR and p-value for each SNP
+# do this for existing and new link preds separately. 
+META = "ALL.W.meta.gz"
+THRESHOLD = 0.80  # threshold for link_pred scores
+rule extract_endometriosis_snps:
+    input:
+        existing_snps = 'Annotations/existing_endo_merged_ld_linkpred_scores.txt',
+        new_snps = 'Annotations/new_endo_merged_ld_linkpred_scores.txt',
+        meta=META
+    output:
+        out='Annotations/endo_merged_gbmi_ld_linkpred.txt'
+    run:
+        existing_snps_df = pd.read_csv(input.existing_snps, sep="\t")
+        new_snps_df = pd.read_csv(input.new_snps, sep="\t")
+
+        existing_snps_df['status'] = 'existing'
+        existing_snps_df['ld_score'] = 0.0  # assuming existing SNPs have no LD score
+        new_snps_df['status'] = 'new'
+
+        # Combine the two DataFrames
+        combined_df = pd.concat([existing_snps_df, new_snps_df], ignore_index=True)
+        combined_df = combined_df[combined_df['linkpred_score'] >= THRESHOLD]
+
+        # >>> print(nan_rows)
+        #             rsid  linkpred_score  chr  pos status  ld_score
+        # 228  rs1323083028          0.9047  NaN  NaN    new       NaN
+        # 260  rs1328487773          0.8299  NaN  NaN    new       NaN
+        # >>> 
+
+        # # by rsid:
+        # combined_df.loc[combined_df['rsid']=="rs1323083028", ['chr','pos','ld_score']] = [2, 198019287, 0.001]
+        # combined_df.loc[combined_df['rsid']=="rs1328487773", ['chr','pos','ld_score']] = [2, 209696809, 0.003]
+
+        # combined_df has columns: rsid, chr, pos, ld_score, linkpred_score, status
+        combined_df[['chr','pos']] = combined_df[['chr','pos']].astype(int)
+        combined_df[['chr','pos']] = combined_df[['chr','pos']].astype(str)
+
+        # # 2) Read the meta file into a DataFrame
+        # meta = pd.read_csv(input.meta, sep="\t", compression='gzip', dtype={'CHR':str,'POS':str})
+
+        # # 3) Merge on chromosome & position to pull in rsid + scores
+        # #    (inner‐join so you only keep rows present in combined)
+        # merged = (meta.merge(combined_df,
+        #                 left_on=['CHR','POS'],
+        #                 right_on=['chr','pos'],
+        #                 how='inner'))
+
+        # 4) Build your SNP_ID column, reorder and write
+        # merged['SNP_ID'] = merged['chr'] + '_' + merged['pos']
+        combined_df['SNP_ID'] = combined_df['chr'] + '_' + combined_df['pos']
+        # out = merged[['SNP_ID', 'status', 'rsid','chr','pos','linkpred_score','ld_score','OR','p-value']]
+        out = combined_df[['SNP_ID', 'status', 'rsid','chr','pos','linkpred_score','ld_score']]
+
+        out.to_csv(output.out, sep="\t", index=False)
+
+rule extract_obesity_snps:
+    input:
+        existing_snps = 'Annotations/existing_obesity_biofilter_snps_annotations.txt',
+        existing_scores = 'existing_snp_obesity_scores.csv',
+        new_snps = 'Annotations/new_obesity_biofilter_snps_annotations.txt',
+        new_scores = 'new_snp_obesity_scores.csv'
+    output:
+        out='Annotations/obesity_merged_linkpred.txt'
+    run:
+        existing_snps_df = pd.read_csv(input.existing_snps, sep="\t", usecols=['position_label', 'chr', 'pos'])
+        existing_scores_df = pd.read_csv(input.existing_scores, sep=",", usecols=['rsid', 'score'])
+
+        new_snps_df = pd.read_csv(input.new_snps, sep="\t", usecols=['position_label', 'chr', 'pos'])
+        new_scores_df = pd.read_csv(input.new_scores, sep=",", usecols=['rsid', 'score'])
+        new_scores_df.rename(columns={'score': 'linkpred_score'}, inplace=True)  # ensure columns are named correctly
+        new_snps_df.rename(columns={'position_label': 'rsid'}, inplace=True)  # rename to match linkpred filee
+
+        existing_scores_df['rsid'] = existing_scores_df['rsid'].apply(lambda x: f"rs{x}")  # add rs prefix
+        existing_scores_df.rename(columns={'score': 'linkpred_score'}, inplace=True)  # ensure columns are named correctly
+        existing_snps_df.rename(columns={'position_label': 'rsid'}, inplace=True)  # rename to match linkpred file
+        
+        new_scores_df['rsid'] = new_scores_df['rsid'].apply(lambda x: f"rs{x}")  # add rs prefix
+
+        existing_snps = pd.merge(existing_scores_df, existing_snps_df, on='rsid', how='left')
+        existing_snps['status'] = 'existing'
+
+        new_snps = pd.merge(new_scores_df, new_snps_df, on='rsid', how='left')
+        new_snps['status'] = 'new'
+
+        # Combine the two DataFrames
+        combined_df = pd.concat([existing_snps, new_snps], ignore_index=True)
+        # print(combined_df['chr'].isna().sum()) # 5373
+        combined_df = combined_df[combined_df['chr'].notna()]  # drop rows where chr is NaN
+        # combined_df = combined_df[combined_df['linkpred_score'] >= THRESHOLD]
+
+        # combined_df has columns: rsid, chr, pos, ld_score, linkpred_score, status
+        combined_df[['chr','pos']] = combined_df[['chr','pos']].astype(int)
+        combined_df[['chr','pos']] = combined_df[['chr','pos']].astype(str)
+        combined_df = combined_df.drop_duplicates(subset='rsid', keep='first')
+        print(combined_df['status'].value_counts())
+        # 4) Build your SNP_ID column, reorder and write
+        combined_df['SNP_ID'] = combined_df['chr'] + '_' + combined_df['pos']
+        out = combined_df[['SNP_ID', 'rsid','chr','pos','status','linkpred_score']]
+
+        out.to_csv(output.out, sep="\t", index=False)
+
+
+# then should have all info to make the manhattan plot! 

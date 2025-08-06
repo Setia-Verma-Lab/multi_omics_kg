@@ -1,0 +1,158 @@
+import pandas as pd
+
+# need to run snakemake -c1 chunk_list.txt first before asking for other files (make sure I also have keep_chunk_list beforehand, as well as the variants.bed file - that is the first file we need)
+# final usage: snakemake --profile lsf --use-envmodules
+
+
+PGEN_DIR = "/chunked_pgen_files"
+KEEP = "samples.keep.txt"
+EXTRACT_RANGES = "variants.bed"  # output from get_extract_range_file
+
+rule all:
+    input:
+        # expand('Merged/endo_genotypes{ext}', ext=['.bed', '.bim', '.fam'])
+        # 'Merged/endo_genotypes_matrix.traw' # for hard call genotypes
+        'Merged/endo_dosage_matrix.traw' # for dosages (floats)
+
+rule get_chunk_list:
+    output:
+        'chunk_list.txt'
+    shell:
+        """
+        ls {PGEN_DIR}/*.psam \
+          | cut -d '/' -f7 \
+          | cut -d '.' -f3 \
+          > {output}
+        """
+
+rule get_keep_chunks:
+    output:
+        chunks='keep_chunk_list.txt'
+    input:
+        chunks='chunk_list.txt',
+        graph_snp_ids="snp_ids.csv"
+    run:
+        import pandas as pd
+        import numpy as np
+
+        chunks = open(input.chunks).read().splitlines()
+        print(chunks[:10])
+
+        chunk_df = pd.DataFrame([chunk.split('_') for chunk in chunks], columns=['chrCHR', 'CHUNK', 'START', 'STOP'], index=chunks)
+        chunk_df = chunk_df[~chunk_df['chrCHR'].isin(['chrY'])]
+        chunk_df[['START', 'STOP']] = chunk_df[['START', 'STOP']].astype(int)
+        print(chunk_df)
+
+        snps = open(input.graph_snp_ids).read().splitlines()[1:]
+        snps = sorted(list(set(snps)))
+
+
+        snp_df = pd.DataFrame([snp.split('_') for snp in snps], columns=['CHR', 'POS'], index=snps)
+        snp_df['chrCHR'] = 'chr' + snp_df['CHR']
+        snp_df = snp_df[~snp_df['chrCHR'].isin(['chrY'])]
+        snp_df[['POS']] = snp_df[['POS']].astype(int)
+
+        print(snp_df)
+
+        C, S = len(chunk_df), len(snp_df)
+
+        comp_shape, comp_shape_T = (S, C), (C, S)
+
+        chunk_chr_2D = np.broadcast_to(chunk_df['chrCHR'], comp_shape)
+        start_2D = np.broadcast_to(chunk_df['START'], comp_shape)
+        stop_2D = np.broadcast_to(chunk_df['STOP'], comp_shape)
+
+        snp_chr_2D = np.broadcast_to(snp_df['chrCHR'], comp_shape_T).T
+        pos_2D = np.broadcast_to(snp_df['POS'], comp_shape_T).T
+
+        snp_in_chunk = (chunk_chr_2D == snp_chr_2D) & (start_2D < pos_2D) & (pos_2D < stop_2D)
+        chunk_has_any_snp = np.any(snp_in_chunk, axis=0)
+
+        keep_chunks = chunk_df[chunk_has_any_snp]
+        print(keep_chunks)
+
+        open(output.chunks, 'w+').write('\n'.join(keep_chunks.index))
+
+rule make_variants_bed:
+    """
+    Convert snp_ids.csv (lines like '1_209721316') into
+    a BED-format file chr, start, end for --extract range.
+    Uses zero-based half-open intervals [pos-1, pos).
+    """
+    input:
+        snps="snp_ids.csv"
+    output:
+        bed=EXTRACT_RANGES
+    run:
+        df = pd.read_csv(input.snps)
+
+        # Split snp_id into chromosome and position
+        df[['chr', 'pos']] = df['snp_id'].str.split('_', expand=True)
+        df['start'] = df['pos'].astype(int) - 1
+        df['end'] = df['pos'].astype(int)
+
+        # Output only BED columns
+        df[['chr', 'start', 'end']].to_csv(output.bed, sep='\t', header=False, index=False)
+
+# per chunk extraction rule
+rule extract_vars_ppl_from_chunk:
+    output:
+        expand('Chunks/{{chunk}}{ext}', ext=['.pgen', '.psam', '.pvar'])
+    input:
+        plink_set=expand(PGEN_DIR + '/PMBB-Release-2024-3.0_genetic_imputed.{{chunk}}{ext}', ext=['.pgen', '.psam', '.pvar']),
+        samples=KEEP,
+        extract=EXTRACT_RANGES
+    params:
+        plink_prefix=PGEN_DIR + '/PMBB-Release-2024-3.0_genetic_imputed.{chunk}',
+        output_prefix='Chunks/{chunk}'
+    envmodules: 'plink/2.0-20240804'
+    resources: mem_mb=16000
+    shell:
+        """
+        plink2 --make-pgen \
+          --pfile {params.plink_prefix} \
+          --keep {input.samples} \
+          --exclude-if-info "R2<=0.4" \
+          --extract range {input.extract} \
+          --out {params.output_prefix}
+        """
+# the 0.4 is more lenient for a threshold of excluding compared to a threshold of 0.8 or 0.9 (those are more conservative)
+
+# gives --make-bed gives hard calls for the genotype but does not give us it in human readable format, need to use --recode A to make .raw file
+# --make-pgen uses dosages. 
+rule merge_chunks:
+    output:
+        expand('Merged/endo_dosage{ext}', ext=['.pgen', '.psam', '.pvar']) # if making bed files, need .bed, .bed, .fam
+    input:
+        plink_sets=expand('Chunks/{chunk}{ext}', chunk=open('keep_chunk_list.txt').read().splitlines(), ext=['.pgen', '.psam', '.pvar'])
+    params:
+        output_prefix='Merged/endo_dosage'
+    envmodules: 'plink/2.0-20240804'
+    resources: mem_mb=16000
+    shell:
+        """
+        echo "{input.plink_sets}" | sed 's| |\\n|g' | grep 'pvar' | sed 's|.pvar||g' > Chunks/merge_list.txt
+        
+        plink2 --make-pgen \
+          --pmerge-list Chunks/merge_list.txt \
+          --out {params.output_prefix}
+        """
+
+rule get_raw_genotype:
+    output:
+        file='Merged/endo_dosage_matrix.traw'
+    input:
+        merged_genotype = expand('Merged/endo_dosage{ext}', ext=['.pgen', '.psam', '.pvar']) # change to bed bim fam if i am doing hard call to match with merge_chunk output
+    envmodules: 'plink/2.0-20240804'
+    params:
+        input_prefix = 'Merged/endo_dosage',
+        output_prefix = 'Merged/endo_dosage_matrix'
+    resources: mem_mb=16000
+    shell:
+        """
+        plink2 --recode A-transpose \
+                --pfile {params.input_prefix} \
+                --out {params.output_prefix}
+        """
+# change --pfile to --bile if I have bed/bim/fam from the merge_chunks rule
+# will need flip the dosages (2 - dosage) when I'm actually processing them later

@@ -1,0 +1,10 @@
+# Path to loki.db or loki-hg19.db. This defines output build
+loki_path: '/project/ssverma_shared/datasets/loki/loki.db'
+biofilter_python: '/home/ananyara/miniforge3/envs/biofilter-env/bin/python'
+biofilter_script: '/project/ssverma_shared/tools/biofilter/biofilter-2.4.3/biofilter.py'
+
+# Input build (can be 19 or 38)
+build: '38'
+
+# KB distance to consider a gene "close"
+close_dist: 5E4

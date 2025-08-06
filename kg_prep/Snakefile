@@ -1,0 +1,560 @@
+import pandas as pd
+import gzip
+import os
+import pronto
+import xml.etree.ElementTree as ET
+import json
+import csv
+import numpy as np
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+import gc
+import shutil
+import uuid
+import glob
+
+# snakemake -c1 --use-envmodules all
+# snakemake --profile lsf --use-envmodules all -> for greater optimization/parallelization/speed
+
+rule all:
+    input:
+        # expand('data/{data}.csv.gz', data=['gene', 'phenotype', 'protein', 'snp_biofilter']) +
+        expand('data/{data}.csv.gz', data=['snp_biofilter_maf_5'])
+
+rule get_snp_node:
+    input:
+        file_path = '/datasets/dbSNP/GCF_000001405.40.gz'
+    output:
+        filename = 'data/snp.csv.gz'
+    run:
+        # doing this in chunks to be more efficient
+        chunksize = 100000
+        column_names = ['chromosome', 'position', 'rsid', 'refAllele', 'altAllele', 'QUAL', 'FILTER', 'INFO']
+
+        first_chunk = True
+        with pd.read_csv(input.file_path, sep='\t', comment='#', compression='gzip', header=None, names=column_names, chunksize=chunksize) as reader:
+            for chunk in reader:
+                chunk['chromosome'] = chunk['chromosome'].str.extract(r'NC_0*(\d+)\.')[0]
+                chunk['snp_id'] = chunk['chromosome'].astype(str) + '_' + chunk['position'].astype(str)
+
+                result = chunk[['snp_id', 'rsid', 'chromosome', 'position', 'refAllele', 'altAllele']]
+
+                # compress the output file with gzip to save space
+                result.to_csv(output.filename, mode='wt' if first_chunk else 'at', index=False, header=first_chunk, compression='gzip')
+                first_chunk = False
+
+rule get_snp_node_biofilter_chrom:
+    input:
+        folder_path = '/datasets/biofilter3R_transformed_datasets/dbSNP/{chrom_dir}'
+    output:
+        filename = 'data/tmp/snp_biofilter_{chrom_dir}.csv.gz'
+    resources:
+        mem_mb=8000
+    run:
+        # Get list of .parquet files
+        files = sorted([f for f in os.listdir(input.folder_path) if f.endswith('.parquet')])
+
+        # Define the column names to read
+        columns = ['rs_id', 'assembly_id', 'position_base_1', 'allele_type', 'allele']
+        previous_tail = pd.DataFrame(columns=columns)
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output.filename), exist_ok=True)
+
+        # Open the output file for streaming (gzip compressed)
+        with gzip.open(output.filename, 'wt') as f_out:
+            # Write header once
+            header_written = False
+
+            for i in range(len(files)):
+                file_path = os.path.join(input.folder_path, files[i])
+                df = pd.read_parquet(file_path, columns=columns, engine='pyarrow')
+
+                df_combined = pd.concat([previous_tail, df], ignore_index=True)
+
+                # Peek at next file's rs_ids if not last file
+                if i < len(files) - 1:
+                    next_file_path = os.path.join(input.folder_path, files[i+1])
+                    df_next = pd.read_parquet(next_file_path, columns=['rs_id'], engine='pyarrow')
+                    next_rsid_set = set(df_next['rs_id'].unique())
+                else:
+                    next_rsid_set = set()
+
+                grouped_df = df_combined.groupby('rs_id', group_keys=False)
+                current_rows = []
+                next_tail = []
+
+                for rsid, group in grouped_df:
+                    if rsid in next_rsid_set:
+                        next_tail.append(group)
+                        continue
+
+                    # process group
+                    ref_row = group[group['allele_type'] == 'ref']
+                    sub_rows = group[group['allele_type'] != 'ref']
+
+                    if ref_row.empty:
+                        continue
+
+                    ref_allele = ref_row['allele'].iloc[0]
+                    chromosome = ref_row['assembly_id'].iloc[0]
+                    position = ref_row['position_base_1'].iloc[0]
+                    symbol = f"{chromosome}_{position}"
+                    alt_alleles = sub_rows['allele'].tolist()
+
+                    current_rows.append({
+                        'snp_id': symbol,
+                        'rsid': rsid,
+                        'chromosome': chromosome,
+                        'refAllele': ref_allele,
+                        'altAllele': alt_alleles,
+                        'position': position
+                    })
+
+                # Convert batch to DataFrame and stream to file
+                batch_df = pd.DataFrame(current_rows)
+                if not batch_df.empty:
+                    batch_df.to_csv(f_out, index=False, header=not header_written)
+                    header_written = True
+
+                # Prepare for next round
+                previous_tail = pd.concat(next_tail, ignore_index=True) if next_tail else pd.DataFrame(columns=columns)
+
+                # Clean up memory
+                del df, df_combined, grouped_df, batch_df
+                if i < len(files) - 1:
+                    del df_next
+                gc.collect()
+
+rule merge_snp_node_biofilter:
+    input:
+        expand('data/tmp/snp_biofilter_{chrom_dir}.csv.gz', chrom_dir=[
+            'dbsnp_chr1', 'dbsnp_chr2', 'dbsnp_chr3', 'dbsnp_chr4', 'dbsnp_chr5', 
+            'dbsnp_chr6', 'dbsnp_chr7', 'dbsnp_chr8', 'dbsnp_chr9', 'dbsnp_chr10',
+            'dbsnp_chr11', 'dbsnp_chr12', 'dbsnp_chr13', 'dbsnp_chr14', 'dbsnp_chr15',
+            'dbsnp_chr16', 'dbsnp_chr17', 'dbsnp_chr18', 'dbsnp_chr19', 'dbsnp_chr20',
+            'dbsnp_chr21', 'dbsnp_chr22', 'dbsnp_chrx', 'dbsnp_chry'
+        ])
+    output:
+        filename = 'data/snp_biofilter.csv.gz'
+    run:
+        os.makedirs(os.path.dirname(output.filename), exist_ok=True)
+
+        with gzip.open(output.filename, 'wt') as f_out:
+            header_written = False
+
+            for infile in input:
+                # Read in chunks of 100,000 rows (adjust as needed)
+                for chunk in pd.read_csv(infile, compression='gzip', chunksize=100000):
+                    chunk.to_csv(f_out, index=False, header=not header_written)
+                    header_written = True
+
+rule get_gene_node:
+    input:
+        data_path = '/datasets/NCBI_Gene_Info/2025_06_Homo_sapiens.gene_info'
+    output:
+        filename = 'new_data/gene.csv.gz'
+    run:
+        df = pd.read_csv(input.data_path, sep='\t')
+
+        #tax_id	GeneID	Symbol	LocusTag	Synonyms	dbXrefs	chromosome	map_location	description	type_of_gene	Symbol_from_nomenclature_authority	Full_name_from_nomenclature_authority	Nomenclature_status	Other_designations	Modification_date	Feature_type
+        df = df[df['#tax_id'] == 9606]
+        df.drop(columns=['#tax_id'])
+        df = df[["GeneID", "Symbol", "chromosome", "Synonyms", "dbXrefs"]]
+        # rename columns
+        df.columns = ['gene_id', 'symbol', 'chromosome', 'synonyms', 'dbXrefs']
+        df['gene_id'] = df['gene_id'].astype(str) + ".0"
+
+        # Fix HGNC:HGNC: typo in dbXrefs
+        df['dbXrefs'] = df['dbXrefs'].str.replace('HGNC:HGNC:', 'HGNC:')
+        # add single quotes around synonyms column
+        df['synonyms'] = df['synonyms'].apply(lambda x: "'" + str(x) + "'")
+        # Save to compressed CSV with header, no index
+        df.to_csv(output.filename, index=False, compression='gzip')
+    
+rule get_phenotype_node:
+    input:
+        # Human phenotype ontology
+        data_path = '/datasets/HPO/hp.obo'
+    output:
+        filename = 'data/phenotype.csv.gz'
+    run: 
+        ontology = pronto.Ontology(input.data_path)
+
+        rows = []
+        # make csv from the ontology object
+        for term in ontology.terms():
+            if term.obsolete == 'true':
+                continue
+
+            # create a row for each term 
+            row = {
+                'phenotype_id': str(term.id).replace(":", "_"),
+                'name': term.name,
+                'dbXrefs': '|'.join(str(x.id) + str(x.description) for x in term.xrefs) if term.xrefs else ''
+            }
+
+            rows.append(row)
+        
+        pd.DataFrame(rows).to_csv(output.filename, index=False, compression='gzip')
+
+
+rule parse_uniprot_xml:
+    input:
+        data_path = '/datasets/UniProtKB/uniprot_sprot_human.xml.gz'
+    output:
+        filename = 'data/intermediate_uniprot_parsed.json'
+    run:
+        # from chatgpt
+        with gzip.open(input.data_path, 'rt') as f:
+            tree = ET.parse(f)
+            root = tree.getroot()
+            ns = {"ns": "https://uniprot.org/uniprot"}
+
+        entries = []
+
+        for entry in root.findall("ns:entry", ns):
+
+            # uniprot id for protein
+            accs = [acc.text for acc in entry.findall("ns:accession", ns)]
+            uniprot_id = accs[0] if accs else None
+
+            # protein primary name
+            protein_name_elem = entry.find("ns:protein/ns:recommendedName/ns:fullName", ns)
+            protein_name = protein_name_elem.text if protein_name_elem is not None else None
+
+            alt_names = [alt.text for alt in entry.findall('ns:protein/ns:alternativeName/ns:fullName', ns)]
+
+            # gene name
+            gene_elem = entry.find("ns:gene/ns:name[@type='primary']", ns)
+            gene_name = gene_elem.text if gene_elem is not None else None
+
+            isoforms = []
+            for iso in entry.findall("ns:comment[@type='alternative products']/ns:isoform", ns):
+                ids = [id_elem.text for id_elem in iso.findall("ns:id", ns)]
+                isoforms.extend(ids)
+
+            entries.append({
+                "protein_id": uniprot_id,
+                "protein_name": protein_name,
+                'alternative_names': "|".join(alt_names),
+                "gene_name": gene_name,
+                "isoforms": isoforms
+            })
+
+        with open(output[0], "w") as f:
+            json.dump(entries, f, indent=2)
+    
+
+rule get_protein_node:
+    input:
+        parsed_json = 'data/intermediate_uniprot_parsed.json'
+    output:
+        filename = 'data/protein.csv.gz'
+    run:
+        with open(input.parsed_json) as file:
+            data = json.load(file)
+
+        df = pd.DataFrame(data)
+        df[["protein_id", "protein_name", "alternative_names"]].dropna().drop_duplicates().to_csv(output.filename, index=False)
+
+
+rule get_snp_gene_edge:
+    input:
+        folder_path = '/datasets/GTEx/eQTLs/sig_pairs',
+        gene_mapping_data = 'data/gene.csv.gz'
+    output:
+        filename = 'data/hasEqtl.csv.gz'
+    resources:
+        mem_mb=8000
+    run:
+
+        beta_tissue_names = []
+        pval_nominal_tissue_names = []
+        pval_beta_tissue_names = []
+        master_df = None
+
+        # gene_id","symbol","chromosome","synonyms","dbXrefs
+        gene_mapping_df = pd.read_csv(input.gene_mapping_data, usecols=['gene_id', 'dbXrefs'], compression='gzip')
+        gene_mapping_df['ensg_id'] = gene_mapping_df['dbXrefs'].str.extract(r'Ensembl:(ENSG\d+)')
+        gene_mapping_df.rename(columns={'gene_id':'entrez_id'}, inplace=True)
+        gene_mapping_df.drop(columns=['dbXrefs'], axis=1, inplace=True)
+
+        # iterate over the files in the data_folder_path
+        for file in sorted(os.listdir(input.folder_path)):
+            file_path = os.path.join(input.folder_path, file)
+            if not file.endswith('.v8.egenes.txt'):
+                continue # only use files that end with *.v8.egenes.txt 
+            
+            tissue_name = str.split(file, ".")[0]
+            beta_tissue_names.append(tissue_name)
+            pval_nominal_tissue_names.append(f'{tissue_name}_pval_nominal')
+            pval_beta_tissue_names.append(f'{tissue_name}_pval_beta')
+
+            df =  pd.read_csv(file_path, sep="\t", usecols = ['variant_id', 'gene_id', 'pval_nominal', 'pval_beta', 'slope'])
+
+            # map ENSG IDs to NCBI/entrez IDs for the genes
+            df['gene_id'] = df['gene_id'].str.split('.', expand=True)[0]
+            df = pd.merge(df, gene_mapping_df, left_on='gene_id', right_on='ensg_id', how='left')
+            df = df[df['entrez_id'].notna()] # drop rows that did not have a matching entrez id
+            df.drop(['gene_id', 'ensg_id'], axis=1, inplace=True)
+
+            df.rename(columns = {'slope':tissue_name, 
+                'variant_id': 'snp_id', 
+                'pval_nominal':f'{tissue_name}_pval_nominal', 
+                'pval_beta': f'{tissue_name}_pval_beta',
+                'entrez_id': 'gene_id'
+            }, inplace=True) 
+
+            # remove chr prefix from variant_id and extract the chromosome and position, to match snp_id format
+            df['snp_id'] = df['snp_id'].str.replace(r'^chr(\d+)_',r'\1_', regex=True).str.extract(r'(\d+_\d+)')[0]
+
+            if master_df is None:
+                master_df = df
+            
+            else:
+                master_df = pd.merge(master_df, df, on=['snp_id', 'gene_id'], how='outer') # outer merge keeps all pairs
+            
+        # fill in missing tissue slope values with 0
+        master_df[beta_tissue_names] = master_df[beta_tissue_names].fillna(0)
+        master_df[pval_beta_tissue_names] = master_df[pval_beta_tissue_names].fillna(0)
+        master_df[pval_nominal_tissue_names] = master_df[pval_nominal_tissue_names].fillna(0)
+
+        # make single column with the list of tissue expressions
+        master_df['tissue_expression'] = master_df[beta_tissue_names].values.tolist()
+        master_df['pval_nominal'] = master_df[pval_nominal_tissue_names].values.tolist()
+        master_df['pval_beta'] = master_df[pval_beta_tissue_names].values.tolist()
+
+        # reorder and save the dataframe
+        master_df = master_df[['snp_id', 'gene_id', 'tissue_expression', 'pval_nominal', 'pval_beta']]
+        master_df.to_csv(output.filename, index=False, compression='gzip')
+
+rule get_snp_phenotype_edge:
+    input: 
+        # open targets
+        folder_path = '/datasets/open_targets/Organized_Tables',
+        hpo_mappings = '/projects/Multi_Omics_KG/kg_prep/hpo_mappings/efo_hpo_mappings.csv'
+    output:
+        filename = 'new_data/snpAssociatedWithDisease.csv.gz'
+    run:
+        # need to make sure that the beta/odds ratio of sumstats always refers to minor allele (alt alleles from dbSNP)
+        # spot checking the above, it holds true already! so should be good!
+
+        hpo_mappings_df = pd.read_csv(input.hpo_mappings)
+        dfs = []
+
+        for file in sorted(os.listdir(input.folder_path)):
+            file_path = os.path.join(input.folder_path, file)
+
+            df = pd.read_csv(file_path, usecols = ['lead_chrom', 'lead_pos', 'lead_ref', 'lead_alt', 'odds_ratio', 'beta', 'pval', 'trait_efo'])
+
+            chr_map_to_num = {"X": "23"}
+            df['lead_chrom'] = df['lead_chrom'].replace(chr_map_to_num)
+            # encoding the SNP as id format specified earlier
+            df['snp_id'] = df['lead_chrom'].astype(str) + '_' + df['lead_pos'].astype(str)
+
+            # encode the disease as HPO ID: join on mappings to get hpo_id for each trait that is an actual phenotype. 
+            df = pd.merge(df, hpo_mappings_df, left_on = 'trait_efo', right_on = "EFO_ID", how = "left").rename(columns={'HPO_ID':'phenotype_id'})
+            
+            # drop rows with no hpo ID
+            df = df[df['phenotype_id'].notna()]
+            df = df[['snp_id', 'phenotype_id', 'odds_ratio', 'beta', 'pval']]
+
+            dfs.append(df)
+
+
+        if dfs:
+            master_df = pd.concat(dfs, ignore_index=True)
+            master_df.to_csv(output.filename, index=False, compression='gzip')
+
+
+rule get_snp_protein_edge:
+    input:
+        # omics-pred pQTL
+        somascan_folder_path = '/datasets/OmicsPredWeights/Model_Files/SomaScan',
+        olink_folder_path = '/datasets/OmicsPredWeights/Model_Files/UKB_Olink_Multiancestry_scores',
+        snp_path = 'data/tmp_maf_1/snp_biofilter.csv.gz',
+        protein_path = 'data/protein.csv.gz'
+    output:
+        intermediate_files = directory('new_data/tmp_pqtl_chunks')
+    resources:
+        mem_mb=16000
+    run:
+        if os.path.exists(output.intermediate_files):
+            shutil.rmtree(output.intermediate_files)
+        os.makedirs(output.intermediate_files, exist_ok=True)
+
+        protein_df = pd.read_csv(input.protein_path, compression='gzip')
+
+        print("read protein file")
+
+        print("about to read biofilter snp file")
+        snp_df = pd.read_csv(input.snp_path, compression='gzip')
+        snp_df['rsid'] = snp_df['rsid'].astype(str)
+
+        def process_pqtl_folder(folder_path, snp_base_path, output_dir):
+
+            for file in os.listdir(folder_path):
+                file_path = os.path.join(folder_path, file)
+
+                metadata = {}
+                with open(file_path, 'rt') as f:
+                    for _ in range(10):
+                        line = f.readline()
+                        if line.startswith('#') and '=' in line:
+                            key, value = line[1:].strip().split('=', 1)
+                            metadata[key] = value
+                
+                # match trait to uniprot id
+                trait_name = metadata.get('trait_reported')
+                matches = protein_df[
+                    protein_df['protein_name'].str.contains(trait_name, case=False, na=False, regex=False) |
+                    protein_df['alternative_names'].str.contains(trait_name, case=False, na=False, regex=False)
+                ]
+
+                if matches.empty:
+                    print(f"Trait {trait_name} not found in protein_df")
+                    continue
+                
+                # looking the reported trait name up in proteins.csv.gz to get what the uniprot id is
+                uniprot_id = matches['protein_id'].iloc[0] 
+
+                print("about to read rest of omics pred txt fiel")
+
+                df = pd.read_csv(file_path, sep='\t', skiprows=10,usecols=['rsid', 'chr_name', 'effect_allele', 'other_allele', 'effect_weight'])
+                df['rsid'] = df['rsid'].str.replace("rs", '')
+
+                print("read omics pred txt")
+                    
+                print("about to read biofilter snp file")
+                
+                # merge snp file just on rsid column, getting back all the ref/alt allele and position info
+                merged = pd.merge(df, snp_df, on='rsid', how='inner')
+
+                if merged.empty:
+                    continue # skip if oculdn't find any matching rsid
+
+                # if refAllele is equal to the effect_allele, then effect_weight, effect_allele and other_allele is unchanged 
+                # if refAllele is equal to the other_allele, then effect_weight needs to multiplied by -1, and flip effect_allele and other_allele
+                flip_condition = merged['refAllele'] == merged['other_allele']
+                merged.loc[flip_condition, 'effect_weight'] *= -1.0
+                merged.loc[flip_condition, ['effect_allele', 'other_allele']] = merged.loc[flip_condition, ['other_allele', 'effect_allele']].values
+
+                merged['protein_id'] = uniprot_id
+                output_df = merged[['snp_id', 'protein_id', 'effect_allele', 'other_allele', 'effect_weight']]
+
+                temp_file = os.path.join(output_dir, f"chunk_{file}.csv.gz")
+                output_df.to_csv(temp_file, index=False, compression='gzip')
+                    
+                del merged, output_df, df, metadata, matches
+                gc.collect()
+
+        somascan_df = process_pqtl_folder(input.somascan_folder_path, input.snp_path, output.intermediate_files)
+        olink_df = process_pqtl_folder(input.olink_folder_path, input.snp_path, output.intermediate_files)
+    
+rule combine_snp_protein_chunks: # from chatgpt
+    input:
+        intermediate_files = directory('data/tmp_pqtl_chunks')
+    output:
+        filename = 'data/hasPqtl.csv.gz'
+    run:
+        temp_file = output.filename.replace('.gz', '')  # temp uncompressed CSV
+
+        chunk_files = sorted(glob.glob(os.path.join(input.intermediate_files, "*.csv.gz")))
+
+        print(f"Found {len(chunk_files)} chunk files. Starting merge...")
+
+        # Write header from the first file, then append without headers
+        with open(temp_file, "w") as fout:
+            for i, fpath in enumerate(chunk_files):
+                print(f"[{i+1}/{len(chunk_files)}] Processing {fpath}")
+                df = pd.read_csv(fpath, compression="gzip")
+                df.to_csv(fout, index=False, header=(i == 0), mode='a')
+
+        # Compress final file
+        with open(temp_file, 'rb') as f_in, gzip.open(output.filename, 'wb') as f_out:
+            f_out.writelines(f_in)
+        os.remove(temp_file)
+
+        print(f"✅ Finished writing merged gzipped file to: {output.filename}")
+
+rule get_gene_phenotype_edge:
+    input:
+        # omics pred PheWAS associations (gene has ENSG ID which is good and mAKE phenotype node have HPO ID rn phecode)
+        data_path = '/datasets/OmicsPredWeights/UKB_Phecode_Associations/phecode_omics_UKB_associations.csv',
+        hpo_mappings = '/projects/Multi_Omics_KG/kg_prep/hpo_mappings/hpo_phecode_map.csv',
+        gene_mapping_data = 'data/gene.csv.gz'
+    output:
+        filename = 'new_data/geneAssociatedWithDisease.csv.gz'
+    run:
+        df = pd.read_csv(input.data_path, usecols = ['PheCode', 'Trait ID', 'Hazard Ratio', 'FDR adjusted P-value'])
+        hpo_mappings_df = pd.read_csv(input.hpo_mappings)
+        gene_mapping_df = pd.read_csv(input.gene_mapping_data, usecols=['gene_id', 'dbXrefs'], compression='gzip')
+        gene_mapping_df['ensg_id'] = gene_mapping_df['dbXrefs'].str.extract(r'Ensembl:(ENSG\d+)')
+        gene_mapping_df.rename(columns={'gene_id':'entrez_id'}, inplace=True)
+
+        # trait ID will either be an ENSG ID or something that wasn't a gene. so need to check if it trait ID starts with 'ENSG', and if it does then we would want a row for it
+        rows_with_ENSG = df[df['Trait ID'].astype(str).str.contains('ENSG')]
+
+        # ensure both columns are the same type
+        rows_with_ENSG['PheCode'] = rows_with_ENSG['PheCode'].astype(str)
+        hpo_mappings_df['phecode'] = hpo_mappings_df['phecode'].astype(str)
+
+        # merge to bring in hpo_term_id from hpo_mappings_df
+        rows_with_ENSG = rows_with_ENSG.merge(
+            hpo_mappings_df[['phecode', 'hpo_term_id']],
+            left_on='PheCode',
+            right_on='phecode',
+            how='left'
+        )
+
+        # filter just the rows with HPO IDs, drop unecessary and rename columns
+        rows_with_HPO = rows_with_ENSG[rows_with_ENSG['hpo_term_id'].notnull()]
+        rows_with_HPO.drop(columns=['PheCode', 'phecode'], inplace=True)
+        rows_with_HPO.rename(columns={'hpo_term_id': 'phenotype_id', 'FDR adjusted P-value':'fdr_adjusted_p_value', 'Hazard Ratio':'hazard_ratio', 'Trait ID':'gene_id'}, inplace=True)
+
+        # map ENSG IDs to Entrez IDs
+        rows_with_HPO = pd.merge(rows_with_HPO, gene_mapping_df, left_on='gene_id', right_on='ensg_id', how='left')
+        rows_with_HPO = rows_with_HPO[rows_with_HPO['entrez_id'].notna()] # drop rows that did not have a match
+        rows_with_HPO.drop('gene_id', axis=1, inplace=True)
+        rows_with_HPO.rename(columns = {'entrez_id':'gene_id'}, inplace=True)
+        # rows_with_HPO['gene_id'] = rows_with_HPO['gene_id'].astype(str).str.split(".").str[0]
+        rows_with_HPO['phenotype_id'] = rows_with_HPO['phenotype_id'].astype(str).str.replace(":", "_")
+        rows_with_HPO['hazard_ratio'] = rows_with_HPO['hazard_ratio'].astype(str).str.split(' (', regex=False).str[0]
+
+        # reorder columns and save to output
+        rows_with_HPO = rows_with_HPO[['gene_id', 'phenotype_id', 'hazard_ratio', 'fdr_adjusted_p_value']]
+        rows_with_HPO.to_csv(output.filename, index=False, compression='gzip')
+
+rule get_gene_protein_edge:
+    input:
+        # TODO (I think biofilter table from uniprot)
+        # need isoform data, and link that with Gene ID (NCBI/entrez) and protein ID (uniprot)
+        parsed_json = 'data/intermediate_uniprot_parsed.json',
+        gene_map = 'data/gene.csv.gz'
+    output: 
+        filename = 'data/hasProteinIsoform.csv.gz'
+    run:
+        with open(input.parsed_json) as file:
+            data = json.load(file)
+
+        # build dataframe from JSON
+        rows = []
+        for d in data:
+            if d["gene_name"] and d["protein_id"]:
+                rows.append({
+                    "gene_name": d["gene_name"],
+                    "protein_id": d["protein_id"],
+                    "isoforms": "|".join(d.get("isoforms", [])) if d.get("isoforms") else ""
+                })
+
+        df = pd.DataFrame(rows).drop_duplicates()
+
+        gene_map_df = pd.read_csv(input.gene_map, compression='gzip')
+        # merge on gene_name and symbol
+        merged_df = pd.merge(df, gene_map_df, left_on="gene_name", right_on="symbol", how="left")
+            
+        # drop rows without Entrez ID, save to output
+        merged_df = merged_df.dropna(subset=['gene_id', 'isoforms'])
+        merged_df = merged_df[['gene_id', 'protein_id', 'isoforms']]
+        merged_df.to_csv(output.filename, index=False)
