@@ -31,6 +31,7 @@ def bootstrap_metric(y_true, y_score, metric_fn, n_boot=200, seed=0, is_prob=Tru
 class HeteroGraphClassifier(pl.LightningModule):
     def __init__(self, num_layers, covariate_dim, hidden_dim=64):
         super().__init__()
+        # self.save_hyperparameters()
         self.init_proj = torch.nn.Linear(1, hidden_dim)
 
         self.convs = torch.nn.ModuleList()
@@ -82,10 +83,10 @@ class HeteroGraphClassifier(pl.LightningModule):
         print(cov)
         if isinstance(cov, (list, tuple)):
             covariates = torch.stack(cov, dim=0)  # → [B, 6]
-        # already a 2-D tensor [B,6]
+        # Case 2: already a 2-D tensor [B,6]
         elif cov.dim() == 2 and cov.size(0) == B:
             covariates = cov
-        # a single flat 1-D tensor of length B*6
+        # Case 3: a single flat 1-D tensor of length B*6
         elif cov.dim() == 1 and cov.numel() == B * 6:
             covariates = cov.view(B, 6)
 
@@ -109,8 +110,27 @@ class HeteroGraphClassifier(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         y     = batch.y.float()
         y_hat = self.forward(batch)
+        # loss  = F.binary_cross_entropy(y_hat, y)
+
+        # # compute batch metrics
+        # acc   = ((y_hat > 0.5).long() == batch.y).float().mean()
+        # auc   = binary_auroc(y_hat, batch.y)
+        # f1    = binary_f1_score(y_hat, batch.y)
+        # auprc = binary_average_precision(y_hat, batch.y)
+
+        # # log loss immediately if you like
+        # # self.log("val_loss_batch", loss, prog_bar=False)
+
+        # # stash for epoch‐end
+        # self._val_losses.append(loss.detach())
+        # self._val_accs.append(acc.detach())
+        # self._val_aucs.append(auc.detach())
+        # self._val_f1s.append(f1.detach())
+        # self._val_auprcs.append(auprc.detach())
+        # store for post‐hoc bootstrap
         self._val_trues.append(y.detach().cpu().numpy())
         self._val_hats.append(y_hat.detach().cpu().numpy())
+        # no return needed
 
     def on_validation_epoch_end(self):
         # concatenate all batches
@@ -124,12 +144,13 @@ class HeteroGraphClassifier(pl.LightningModule):
         f10    = f1_score(y_true, y_pred)
         auprc0 = average_precision_score(y_true, y_prob)
 
-        # bootstrap for std
+        # bootstrap for ± std
         auc_mean,   auc_std   = bootstrap_metric(y_true, y_prob,    roc_auc_score)
         acc_mean,   acc_std   = bootstrap_metric(y_true, y_pred,    accuracy_score, is_prob=False)
         f1_mean,    f1_std    = bootstrap_metric(y_true, y_pred,    f1_score, is_prob=False)
         auprc_mean, auprc_std = bootstrap_metric(y_true, y_prob,    average_precision_score)
 
+        # log both
         self.log('val_auc',   auc0,   prog_bar=True)
         self.log('val_auc_std',   auc_std)
         self.log('val_acc',   acc0,   prog_bar=True)
